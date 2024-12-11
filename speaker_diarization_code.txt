@@ -1,0 +1,149 @@
+pip install simpleder
+
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.layers import Input, LSTM, Dense, Attention, Concatenate, Embedding, TimeDistributed, Lambda
+from tensorflow.keras.models import Model
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.utils import to_categorical
+import librosa
+import os
+import glob
+import simpleder
+from tensorflow.keras.layers import TimeDistributed
+
+from google.colab import drive
+drive.mount('/content/drive')
+DATASET_PATH = '/content/drive/MyDrive/Dataset'
+
+# Function to load audio files and extract features
+def extract_features(audio_path, sr=16000, n_mfcc=26):
+    y, sr = librosa.load(audio_path, sr=sr)
+    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=n_mfcc)
+    return mfcc.T
+
+def load_and_process_data(dataset_path):
+    features, labels = [], []
+    audio_files = glob.glob(os.path.join(dataset_path, '**', '*.wav'), recursive=True)  # Adjust to lowercase
+    print(f"Found {len(audio_files)} audio files in the dataset.")  # Debugging statement
+
+    if len(audio_files) == 0:
+        raise ValueError("No audio files found. Please check the dataset path and file extension.")
+
+    for audio_file in audio_files:
+        audio_features = extract_features(audio_file)
+        speaker_label = os.path.basename(os.path.dirname(audio_file))
+        features.append(audio_features)
+        labels.append(speaker_label)
+
+    max_length = max(len(feature) for feature in features)
+    padded_features = [np.pad(feature, ((0, max_length - len(feature)), (0, 0))) for feature in features]
+    return np.array(padded_features), np.array(labels)
+
+# Load and process dataset
+X, y = load_and_process_data(DATASET_PATH)
+print("Data loaded. Shape of features:", X.shape)
+print(len(y))
+
+# Convert string labels to numerical using one-hot encoding
+unique_labels = np.unique(y)
+label_mapping = {label: i for i, label in enumerate(unique_labels)}
+numerical_labels = np.array([label_mapping[label] for label in y])
+y_onehot = to_categorical(numerical_labels)
+dim = int(X.shape[2])
+sequence_length = int(X.shape[1])
+num_classes = y_onehot.shape[1]
+print("Dimension :",dim)
+print("Sequence Length :",sequence_length)
+print("Shape of y_onehot:", y_onehot.shape)
+#print("Number of classes:", num_classes)
+
+# Embedding Enhancer with TimeDistributed
+embedding_input = Input(shape=(dim,))
+embedding_dense = Dense(128, activation="relu")(embedding_input)
+embedding_output = Dense(128, activation="relu")(embedding_dense)
+embedding_model = Model(embedding_input, embedding_output)
+
+# Apply embedding enhancer across the time dimension
+enhanced_input_layer = Input(shape=(sequence_length, dim))
+time_distributed_embedding = TimeDistributed(embedding_model)(enhanced_input_layer)
+embedding_enhancer = Model(inputs=enhanced_input_layer, outputs=time_distributed_embedding)
+X_enhanced = embedding_enhancer.predict(X)
+print("Shape of X_enhanced:", X_enhanced.shape)
+
+# Encoder setup
+encoder_inputs = Input(shape=(None, 128))  # Updated shape with enhanced features
+encoder_lstm = LSTM(64, return_sequences=True, return_state=True)
+encoder_outputs, state_h, state_c = encoder_lstm(encoder_inputs)
+encoder_states = [state_h, state_c]
+
+# Decoder setup with iterative decoding and adaptive attention
+decoder_inputs = Input(shape=(None, 128))  # Decoder inputs match enhanced feature dimensions
+decoder_lstm = LSTM(64, return_sequences=True, return_state=True)
+context_vectors = []
+current_states = encoder_states
+
+# Iterative decoding (3 iterations for refinement)
+for _ in range(3):
+    decoder_outputs, _, _ = decoder_lstm(decoder_inputs, initial_state=current_states)
+    attention = Attention()  
+    context_vector = attention([decoder_outputs, encoder_outputs])
+    context_vectors.append(context_vector)
+
+# Adaptive attention mechanism: Average the context vectors from all iterations
+context_vector_final = Lambda(lambda x: tf.reduce_mean(tf.stack(x, axis=1), axis=1))(context_vectors)
+
+# Concatenate last time step context with the last time step of decoder output
+last_timestep_context = context_vector_final[:, -1, :]
+decoder_combined_context = Concatenate(axis=-1)([last_timestep_context, decoder_outputs[:, -1, :]])
+
+# Dense layers for classification
+dense_1 = Dense(64, activation="relu")(decoder_combined_context)
+final_output = Dense(num_classes, activation="softmax")(dense_1)
+
+# Define and compile the complete model
+model = Model([encoder_inputs, decoder_inputs], final_output)
+model.compile(optimizer=Adam(), loss="categorical_crossentropy", metrics=["accuracy"])
+
+# Fit model with the same input for encoder and decoder for simplicity
+history = model.fit([X_enhanced, X_enhanced], y_onehot, epochs=5, batch_size=32)
+
+epoch_accuracies = history.history['accuracy']
+overall_accuracy = sum(epoch_accuracies) / len(epoch_accuracies) * 100
+print(f"Overall Accuracy Percentage: {overall_accuracy:.2f}%")
+
+y_pred = model.predict([X_enhanced, X_enhanced])
+predicted_labels = np.argmax(y_pred, axis=1)
+true_labels = np.argmax(y_onehot, axis=1)
+
+# DER calculation
+def create_segment_tuples(speaker_labels):
+    segments = []
+    for i, speaker in enumerate(speaker_labels):
+        segments.append((str(speaker), float(i), float(i + 1)))
+    return segments
+
+ref = create_segment_tuples(true_labels)
+hyp = create_segment_tuples(predicted_labels)
+error = simpleder.DER(ref, hyp) * 100
+print("DER={:.3f}".format(error))
+
+# Select a single sample from your dataset for testing
+X_test_sample = X_enhanced[0:1]  # Choose the first sample (or any other sample)
+y_test_sample = y_onehot[0:1]    # Corresponding label for the chosen sample
+
+# Predict output for the sample
+final_output_test = model.predict([X_test_sample, X_test_sample])
+
+# Predicted label
+predicted_label_index = np.argmax(final_output_test, axis=-1)[0]  # Get the predicted label index
+predicted_label_str = unique_labels[predicted_label_index]  # Map index to original string label
+
+# Actual label
+actual_label_index = np.argmax(y_test_sample, axis=-1)  # Get the actual label index
+actual_label_str = unique_labels[actual_label_index]  # Map index to original string label
+
+# Display the results
+#print("Input features shape:", X_test_sample.shape)
+print("Predicted class label :", predicted_label_str)
+print("Actual class label :", actual_label_str)
